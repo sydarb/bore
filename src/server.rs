@@ -1,6 +1,7 @@
 //! Server implementation for the `bore` service.
 
 use std::{io, net::SocketAddr, ops::RangeInclusive, sync::Arc, time::Duration};
+use std::collections::hash_map::DefaultHasher;
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -12,6 +13,18 @@ use uuid::Uuid;
 
 use crate::auth::Authenticator;
 use crate::shared::{proxy, ClientMessage, Delimited, ServerMessage, CONTROL_PORT};
+use crate::local_ip::get;
+
+fn get_local_ip_address() -> Option<String> {
+    get().ok().and_then(|ip| ip.first())
+}
+
+fn hash(s: &str) -> u64 {
+    // a simple hash function (TODO: replace with a better implementation)
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// State structure for the server.
 pub struct Server {
@@ -60,6 +73,14 @@ impl Server {
         }
     }
 
+    fn assign_port_deterministic(&self, secret: &str, iter: usize) -> u16 {
+        let ip_addr = get_local_ip_address().unwrap_or_else(|| "127.0.0.1".to_string());
+        let secret = self.auth.as_ref().and_then(|auth| auth.secret());
+        let input = format!("{}{}{}{}", ip_addr, secret, self.port_range, iter);
+        let hash_value = hash(&input);
+        *self.port_range.start() + (hash_value % (*self.port_range.end() - *self.port_range.start() + 1)) as u16
+    }
+
     async fn create_listener(&self, port: u16) -> Result<TcpListener, &'static str> {
         let try_bind = |port: u16| async move {
             TcpListener::bind(("0.0.0.0", port))
@@ -78,16 +99,8 @@ impl Server {
             try_bind(port).await
         } else {
             // Client requests any available port in range.
-            //
-            // In this case, we bind to 150 random port numbers. We choose this value because in
-            // order to find a free port with probability at least 1-δ, when ε proportion of the
-            // ports are currently available, it suffices to check approximately -2 ln(δ) / ε
-            // independently and uniformly chosen ports (up to a second-order term in ε).
-            //
-            // Checking 150 times gives us 99.999% success at utilizing 85% of ports under these
-            // conditions, when ε=0.15 and δ=0.00001.
-            for _ in 0..150 {
-                let port = fastrand::u16(self.port_range.clone());
+            for attempt in 0..150 {
+                let port = self.assign_port_deterministic(attempt);
                 match try_bind(port).await {
                     Ok(listener) => return Ok(listener),
                     Err(_) => continue,
